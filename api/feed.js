@@ -1,4 +1,5 @@
-// Vercel serverless function: fetches your Canvas calendar feed so the browser can read it.
+// Vercel serverless function: fetches a calendar feed so the browser can read it.
+// Allowed: Canvas feed links (.../feeds/calendars/<id>.ics) and Apple/iCloud published calendars.
 const dns = require('dns').promises;
 const net = require('net');
 
@@ -15,27 +16,43 @@ function isPrivate(ip) {
   return x === '::1' || x === '::' || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('fe80') || x.startsWith('::ffff:');
 }
 
+function notAllowed(u) {
+  if (u.protocol !== 'https:') return 'The link must use https.';
+  const canvas = /\/feeds\/calendars\/[^/]+\.ics$/i.test(u.pathname);
+  const apple = /^p\d+-caldav\.icloud\.com$/i.test(u.hostname) && /^\/published\//i.test(u.pathname);
+  if (!canvas && !apple) return 'That is not a Canvas calendar feed link or an Apple published calendar link.';
+  return null;
+}
+
 async function fetchFeed(raw) {
   let u;
-  try { u = new URL(String(raw).replace(/^webcal:/i, 'https:')); } catch { throw [400, 'That does not look like a link.']; }
-  if (u.protocol !== 'https:') throw [400, 'The link must use https.'];
-  if (!/\/feeds\/calendars\/[^/]+\.ics$/i.test(u.pathname)) throw [400, 'That is not a Canvas calendar feed link (it should end in .ics).'];
-  const addrs = await dns.lookup(u.hostname, { all: true }).catch(() => { throw [502, 'Could not find that website.']; });
-  if (!addrs.length || addrs.some(a => isPrivate(a.address))) throw [400, 'That address is not allowed.'];
+  try { u = new URL(String(raw).trim().replace(/^webcal:/i, 'https:')); } catch { throw [400, 'That does not look like a link.']; }
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 8000);
   try {
-    const r = await fetch(u, { redirect: 'manual', signal: ctl.signal, headers: { 'user-agent': 'canvas-due/1.0', accept: 'text/calendar,*/*' } });
-    if (r.status >= 300 && r.status < 400) throw [502, 'Canvas redirected the request. Re-copy the feed link from Canvas.'];
-    if (!r.ok) throw [502, 'Canvas returned an error (' + r.status + '). The link may have been reset.'];
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > MAX_BYTES) throw [502, 'The calendar is too large.'];
-    const text = buf.toString('utf8');
-    if (!text.includes('BEGIN:VCALENDAR')) throw [502, 'That link did not return a calendar.'];
-    return text;
+    for (let hop = 0; hop < 4; hop++) {
+      const bad = notAllowed(u);
+      if (bad) throw [400, hop ? 'The calendar link redirected somewhere that is not allowed.' : bad];
+      const addrs = await dns.lookup(u.hostname, { all: true }).catch(() => { throw [502, 'Could not find that website.']; });
+      if (!addrs.length || addrs.some(a => isPrivate(a.address))) throw [400, 'That address is not allowed.'];
+      const r = await fetch(u, { redirect: 'manual', signal: ctl.signal, headers: { 'user-agent': 'canvas-due/1.0', accept: 'text/calendar,*/*' } });
+      if (r.status >= 300 && r.status < 400) {
+        const loc = r.headers.get('location');
+        if (!loc) throw [502, 'The calendar link redirected without a destination.'];
+        u = new URL(loc, u);
+        continue;
+      }
+      if (!r.ok) throw [502, 'The calendar service returned an error (' + r.status + '). The link may have been reset or unpublished.'];
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length > MAX_BYTES) throw [502, 'The calendar is too large.'];
+      const text = buf.toString('utf8');
+      if (!text.includes('BEGIN:VCALENDAR')) throw [502, 'That link did not return a calendar.'];
+      return text;
+    }
+    throw [502, 'The calendar link redirected too many times.'];
   } catch (e) {
     if (Array.isArray(e)) throw e;
-    throw [502, e.name === 'AbortError' ? 'Canvas took too long to respond.' : 'Could not reach Canvas.'];
+    throw [502, e.name === 'AbortError' ? 'The calendar service took too long to respond.' : 'Could not reach the calendar service.'];
   } finally { clearTimeout(timer); }
 }
 
